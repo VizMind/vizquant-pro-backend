@@ -12,6 +12,8 @@ CACHE_DIR = Path(__file__).resolve().parents[1] / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL = pd.Timedelta(hours=24)
 
+GEO_RESTRICTED_FALLBACKS: list[str] = ["bybit"]
+
 
 def _get_cache_path(symbol: str, timeframe: str, exchange_id: str) -> Path:
     safe_symbol = symbol.replace("/", "_").replace(" ", "_").replace(":", "_")
@@ -322,21 +324,56 @@ def fetch_ohlcv(
         except Exception as exc:
             logger.warning("載入緩存失敗，將重新抓取資料: %s", exc)
 
-    try:
-        exchange_cls = getattr(ccxt, exchange_id)
-        exchange = exchange_cls({"enableRateLimit": True})
-    except AttributeError as exc:
-        raise ValueError(f"不支援的交易所: {exchange_id}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"建立交易所連線失敗: {exc}") from exc
+    def _build_exchange(eid: str):
+        try:
+            cls = getattr(ccxt, eid)
+            return cls({"enableRateLimit": True})
+        except AttributeError as exc:
+            raise ValueError(f"不支援的交易所: {eid}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"建立交易所連線失敗: {exc}") from exc
+
+    def _is_geo_restricted(err: Exception) -> bool:
+        msg = str(err)
+        return "451" in msg or "restricted location" in msg.lower()
+
+    active_exchange_id = exchange_id
+    exchange = _build_exchange(active_exchange_id)
 
     try:
         raw_ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
     except ccxt.BaseError as exc:
-        logger.exception("CCXT 讀取 OHLCV 失敗")
-        raise RuntimeError(
-            f"無法從 {exchange_id} 取得 {symbol} 的 OHLCV 歷史資料: {exc}"
-        ) from exc
+        if _is_geo_restricted(exc):
+            logger.warning(
+                "交易所 %s 因地區限制 (451) 無法存取，嘗試備用交易所…", exchange_id
+            )
+            raw_ohlcv = None
+            for fallback_id in GEO_RESTRICTED_FALLBACKS:
+                if fallback_id == exchange_id:
+                    continue
+                try:
+                    fallback_exchange = _build_exchange(fallback_id)
+                    raw_ohlcv = fallback_exchange.fetch_ohlcv(
+                        symbol, timeframe, since=since_ms, limit=limit
+                    )
+                    active_exchange_id = fallback_id
+                    cache_path = _get_cache_path(symbol, timeframe, active_exchange_id)
+                    logger.info("已切換至備用交易所: %s", fallback_id)
+                    break
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "備用交易所 %s 也失敗: %s", fallback_id, fallback_exc
+                    )
+            if raw_ohlcv is None:
+                raise RuntimeError(
+                    f"無法從 {exchange_id} 取得 {symbol} 的 OHLCV 歷史資料（地區限制），"
+                    f"備用交易所也無法使用: {exc}"
+                ) from exc
+        else:
+            logger.exception("CCXT 讀取 OHLCV 失敗")
+            raise RuntimeError(
+                f"無法從 {exchange_id} 取得 {symbol} 的 OHLCV 歷史資料: {exc}"
+            ) from exc
 
     if not raw_ohlcv:
         raise ValueError(
