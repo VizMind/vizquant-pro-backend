@@ -4,7 +4,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import ccxt
 import pandas as pd
-import vectorbt as vbt
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +46,6 @@ def _parse_start_date(start_date: str) -> int:
     except Exception as exc:
         raise ValueError(
             f"起始日期格式錯誤，請使用 ISO 格式字串，例如 '2024-01-01T00:00:00Z'。收到: {start_date}"
-        ) from exc
-
-
-def _convert_timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
-    try:
-        return pd.Timedelta(timeframe)
-    except Exception as exc:
-        raise ValueError(
-            f"時間週期格式錯誤，請使用 pandas 可解析的時間字串，例如 '1h', '15m', '1d'。收到: {timeframe}"
         ) from exc
 
 
@@ -236,9 +226,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyFunction] = {
 }
 
 
-def _build_equity_curve(portfolio: vbt.Portfolio, init_cash: float) -> list[Dict[str, Any]]:
+def _build_equity_curve(equity_series: pd.Series, init_cash: float) -> list[Dict[str, Any]]:
     """生成回測期間每個時間點的累積報酬率序列。"""
-    equity_series = portfolio.value()
     cumulative_return = equity_series / init_cash - 1.0
     return [
         {
@@ -260,45 +249,97 @@ def _build_price_series(price_df: pd.DataFrame) -> list[Dict[str, Any]]:
     ]
 
 
+def _run_simple_backtest(
+    close: pd.Series,
+    entries: pd.Series,
+    exits: pd.Series,
+    init_cash: float = 10000.0,
+) -> Dict[str, Any]:
+    """純 pandas 回測引擎（取代 vectorbt），記憶體消耗極低。"""
+    cash = init_cash
+    position = 0.0
+    entry_price = 0.0
+    entry_idx_val: Optional[int] = None
+    trade_id = 0
+    trades: list[Dict[str, Any]] = []
+    equity_values: list[float] = []
+
+    close_arr = close.to_numpy(dtype=float)
+    entries_arr = entries.fillna(False).to_numpy(dtype=bool)
+    exits_arr = exits.fillna(False).to_numpy(dtype=bool)
+
+    for i in range(len(close_arr)):
+        cp = close_arr[i]
+        if position > 0 and exits_arr[i]:
+            pnl = (cp - entry_price) * position
+            cash = position * cp
+            trades.append({
+                "id": trade_id,
+                "entry_idx": entry_idx_val,
+                "exit_idx": i,
+                "entry_price": entry_price,
+                "exit_price": cp,
+                "size": position,
+                "pnl": pnl,
+                "direction": "long",
+            })
+            trade_id += 1
+            position = 0.0
+            entry_price = 0.0
+            entry_idx_val = None
+        if position == 0 and entries_arr[i]:
+            position = cash / cp
+            entry_price = cp
+            entry_idx_val = i
+            cash = 0.0
+        equity_values.append(cash + position * cp)
+
+    # 收盤仍持有倉位，以最後收盤價計算
+    if position > 0:
+        last_price = close_arr[-1]
+        trades.append({
+            "id": trade_id,
+            "entry_idx": entry_idx_val,
+            "exit_idx": len(close_arr) - 1,
+            "entry_price": entry_price,
+            "exit_price": last_price,
+            "size": position,
+            "pnl": (last_price - entry_price) * position,
+            "direction": "long",
+        })
+
+    equity_series = pd.Series(equity_values, index=close.index)
+    return {"equity_series": equity_series, "trades": trades}
+
+
 def _extract_trade_signals(
-    price_df: pd.DataFrame, portfolio: vbt.Portfolio
+    price_df: pd.DataFrame, trades: list[Dict[str, Any]]
 ) -> list[Dict[str, Any]]:
-    """從 portfolio.trades 中抽取進出場訊號，用於圖表標註。"""
-    records = portfolio.trades.records
-    if records.empty:
+    """從交易記錄中抽取進出場訊號，用於圖表標註。"""
+    if not trades:
         return []
 
     signals: list[Dict[str, Any]] = []
-    for row in records.itertuples(index=False):
-        direction = "long" if int(getattr(row, "direction", 0)) == 0 else "short"
-        trade_id = int(getattr(row, "id", -1))
-        entry_idx = int(row.entry_idx)
-        entry_timestamp = price_df.index[entry_idx].isoformat()
-        signals.append(
-            {
-                "type": "buy",
-                "trade_id": trade_id,
-                "timestamp": entry_timestamp,
-                "price": float(row.entry_price),
-                "size": float(getattr(row, "size", 0.0)),
-                "direction": direction,
-            }
-        )
-
-        exit_idx_val = getattr(row, "exit_idx", None)
-        if exit_idx_val is not None and pd.notnull(exit_idx_val):
-            exit_idx = int(exit_idx_val)
-            exit_timestamp = price_df.index[exit_idx].isoformat()
-            signals.append(
-                {
-                    "type": "sell",
-                    "trade_id": trade_id,
-                    "timestamp": exit_timestamp,
-                    "price": float(row.exit_price),
-                    "size": float(getattr(row, "size", 0.0)),
-                    "direction": direction,
-                }
-            )
+    for trade in trades:
+        entry_idx = trade["entry_idx"]
+        signals.append({
+            "type": "buy",
+            "trade_id": trade["id"],
+            "timestamp": price_df.index[entry_idx].isoformat(),
+            "price": float(trade["entry_price"]),
+            "size": float(trade["size"]),
+            "direction": trade["direction"],
+        })
+        exit_idx = trade.get("exit_idx")
+        if exit_idx is not None:
+            signals.append({
+                "type": "sell",
+                "trade_id": trade["id"],
+                "timestamp": price_df.index[exit_idx].isoformat(),
+                "price": float(trade["exit_price"]),
+                "size": float(trade["size"]),
+                "direction": trade["direction"],
+            })
 
     return sorted(signals, key=lambda item: item["timestamp"])
 
@@ -449,32 +490,27 @@ def run_backtest(
 
     initial_cash = 10000.0
     try:
-        freq = _convert_timeframe_to_timedelta(timeframe)
-        portfolio = vbt.Portfolio.from_signals(
-            price_df["close"],
-            entries,
-            exits,
-            freq=freq,
-            init_cash=initial_cash,
-            fees=0.0,
-            slippage=0.0,
+        backtest_result = _run_simple_backtest(
+            price_df["close"], entries, exits, init_cash=initial_cash
         )
+        equity_series = backtest_result["equity_series"]
+        trades = backtest_result["trades"]
     except Exception as exc:
-        logger.exception("vectorbt 回測計算失敗")
+        logger.exception("回測計算失敗")
         raise RuntimeError(f"回測計算失敗: {exc}") from exc
 
     try:
-        cumulative_return = float(portfolio.total_return())
-        max_drawdown = float(portfolio.max_drawdown())
-        trade_count = int(len(portfolio.trades))
-        equity_curve = _build_equity_curve(portfolio, initial_cash)
-        signals = _extract_trade_signals(price_df, portfolio)
+        cumulative_return = float(equity_series.iloc[-1] / initial_cash - 1.0)
+        rolling_max = equity_series.cummax()
+        drawdown = (equity_series - rolling_max) / rolling_max
+        max_drawdown = float(drawdown.min())
+        trade_count = len(trades)
+        equity_curve = _build_equity_curve(equity_series, initial_cash)
+        signals = _extract_trade_signals(price_df, trades)
         price_series = _build_price_series(price_df)
 
-        # Win rate: fraction of trades with positive PnL
         if trade_count > 0:
-            trade_records = portfolio.trades.records
-            winning = int((trade_records["pnl"] > 0).sum())
+            winning = sum(1 for t in trades if t["pnl"] > 0)
             win_rate = winning / trade_count
         else:
             win_rate = 0.0
